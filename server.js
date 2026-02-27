@@ -67,32 +67,20 @@ async function fetchPair(page, key, path) {
   lastPageText = `[${key}] status=${status}\nTexto: ${text}\nNúmeros: ${numbers.join(', ')}`;
   console.log(lastPageText);
 
-  // Bid/Ask: "5.12776/3456"
+  // Bid/Ask: "5.13000/200" → bid=5.13000, ask=5.13200
   const bidAskMatch = text.match(/(\d+\.\d+)\/(\d+)/);
   if (!bidAskMatch) {
-    // Tenta pegar qualquer número razoável como spot
-    const spot = numbers.find(n => {
-      const v = parseFloat(n);
-      return key === 'USD' ? v > 4 && v < 8 :
-             key === 'EUR' ? v > 5 && v < 10 :
-             key === 'AED' ? v > 1 && v < 3 :
-             key === 'GBP' ? v > 5 && v < 10 : false;
-    });
-    if (spot) {
-      const s = parseFloat(spot);
-      console.log(`${key}: usando spot aproximado ${s}`);
-      return { buy: parseFloat((s*0.999).toFixed(4)), sell: parseFloat((s*1.001).toFixed(4)),
-               spot: s, variation: 0, high: parseFloat((s*1.005).toFixed(4)), low: parseFloat((s*0.995).toFixed(4)) };
-    }
     throw new Error(`${key}: dados não encontrados. Números: ${numbers.join(', ')}`);
   }
 
   const bidStr = bidAskMatch[1];
   const askSuffix = bidAskMatch[2];
   const bid = parseFloat(bidStr);
-  const bidDecimals = bidStr.split('.')[1];
+  const bidDecimals = bidStr.split('.')[1]; // ex: "13000"
+  // O sufixo substitui os últimos N dígitos dos decimais
   const askDecimals = bidDecimals.slice(0, bidDecimals.length - askSuffix.length) + askSuffix;
   const ask = parseFloat(bidStr.split('.')[0] + '.' + askDecimals);
+  console.log(`${key}: bid=${bid} ask=${ask} (suffix="${askSuffix}")`)
 
   const rangeMatch = text.match(/(\d+\.\d+)\s*-\s*(\d+\.\d+)/);
   const low  = rangeMatch ? parseFloat(rangeMatch[1]) : bid;
