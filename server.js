@@ -7,7 +7,7 @@ const PORT = process.env.PORT || 3099;
 const PAIRS = [
   { key: 'USD', path: '/currencies/usdbrl/idc-lite' },
   { key: 'EUR', path: '/currencies/eurbrl/idc-lite' },
-  { key: 'AED', path: '/currencies/aedbrl/idc-lite' },
+  { key: 'AED', path: '/currencies/aed-brl/idc-lite' },
   { key: 'GBP', path: '/currencies/gbpbrl/idc-lite' },
 ];
 
@@ -67,6 +67,12 @@ async function fetchPair(page, key, path) {
   lastPageText = `[${key}] status=${status}\nTexto: ${text}\nNúmeros: ${numbers.join(', ')}`;
   console.log(lastPageText);
 
+  // Log completo para diagnóstico de pares problemáticos
+  if (numbers.length === 0) {
+    const rawHtml = await page.evaluate(() => document.body.innerHTML.substring(0, 800));
+    console.log(`${key} HTML RAW: ${rawHtml}`);
+  }
+
   // Bid/Ask: "5.13000/200" → bid=5.13000, ask=5.13200
   const bidAskMatch = text.match(/(\d+\.\d+)\/(\d+)/);
   if (!bidAskMatch) {
@@ -104,12 +110,18 @@ async function refresh() {
 
     const rates = {};
     for (const { key, path } of PAIRS) {
-      rates[key] = await fetchPair(page, key, path);
-      console.log(`  ✅ ${key}: ${rates[key].spot}`);
+      try {
+        rates[key] = await fetchPair(page, key, path);
+        console.log(`  ✅ ${key}: ${rates[key].spot}`);
+      } catch (err) {
+        console.error(`  ❌ ${key}: ${err.message}`);
+        // Mantém valor anterior se existir
+        rates[key] = (cache.rates && cache.rates[key]) || FALLBACK[key];
+      }
     }
 
     cache = { rates, updatedAt: new Date().toISOString() };
-    console.log('Fetch concluído com sucesso');
+    console.log('Fetch concluído');
   } catch (err) {
     console.error('Erro no fetch:', err.message);
     if (browser) {
