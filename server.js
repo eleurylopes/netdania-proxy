@@ -1,5 +1,5 @@
 const express = require('express');
-const puppeteer = require('puppeteer-core');
+const https = require('https');
 
 const app = express();
 const PORT = process.env.PORT || 3099;
@@ -13,131 +13,120 @@ const PAIRS = [
 ];
 
 const FALLBACK = {
-  USD: { buy: 5.12, sell: 5.14, spot: 5.13, variation: -0.17, high: 5.17, low: 5.12 },
-  EUR: { buy: 5.58, sell: 5.60, spot: 5.59, variation: 0, high: 5.62, low: 5.55 },
-  AED: { buy: 1.394, sell: 1.399, spot: 1.396, variation: 0, high: 1.407, low: 1.391 },
-  GBP: { buy: 6.50, sell: 6.53, spot: 6.51, variation: 0, high: 6.55, low: 6.48 },
+  USD: { buy: 5.1277, sell: 5.1346, spot: 5.1311, variation: -0.17, high: 5.1698, low: 5.1203 },
+  EUR: { buy: 5.7800, sell: 5.7900, spot: 5.7850, variation: 0, high: 5.8100, low: 5.7500 },
+  AED: { buy: 1.3960, sell: 1.3980, spot: 1.3970, variation: 0, high: 1.4080, low: 1.3940 },
+  GBP: { buy: 6.5200, sell: 6.5400, spot: 6.5300, variation: 0, high: 6.5600, low: 6.5000 },
 };
 
 let cache = { rates: null, updatedAt: null };
 let logs = [];
-let browser = null;
 
 function log(msg) {
-  console.log(msg);
-  logs.push(`${new Date().toISOString().slice(11,19)} ${msg}`);
+  const ts = new Date().toISOString().slice(11, 19);
+  console.log(`${ts} ${msg}`);
+  logs.push(`${ts} ${msg}`);
   if (logs.length > 50) logs.shift();
 }
 
-async function launchBrowser() {
-  if (browser) { try { await browser.close(); } catch(e) {} browser = null; }
-  log('Iniciando Chrome...');
-  browser = await puppeteer.launch({
-    executablePath: process.env.CHROME_PATH || '/usr/bin/google-chrome-stable',
-    headless: true,
-    args: [
-      '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
-      '--disable-gpu', '--no-first-run',
-      // removido --single-process que causava crashes
-    ],
-  });
-  log('Chrome pronto');
-  return browser;
-}
-
-async function fetchPair(key, path) {
-  // Nova página por par para evitar frame detached
-  const b = browser && browser.isConnected() ? browser : await launchBrowser();
-  const page = await b.newPage();
-  try {
-    await page.setUserAgent('Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1');
-    const resp = await page.goto(`https://m.netdania.com${path}`, { waitUntil: 'networkidle2', timeout: 25000 });
-    const status = resp.status();
-
-    try { await page.waitForFunction(() => /\d+\.\d+/.test(document.body.innerText), { timeout: 5000 }); } catch(e) {}
-
-    const { text, numbers } = await page.evaluate(() => {
-      const t = document.body.innerText;
-      return { text: t.substring(0, 600), numbers: (t.match(/\d+\.\d+/g) || []).slice(0, 10) };
+// ─── FETCH HTML via https (sem Puppeteer) ───────────────────
+function fetchPage(path) {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: 'm.netdania.com',
+      path,
+      method: 'GET',
+      timeout: 15000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+      },
+    };
+    const req = https.get(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => resolve(data));
     });
-
-    log(`${key} HTTP=${status} nums=${numbers.length}`);
-
-    const bidAskMatch = text.match(/(\d+\.\d+)\/(\d+)/);
-    if (!bidAskMatch) throw new Error(`${key}: padrão bid/ask não encontrado`);
-
-    const bidStr = bidAskMatch[1];
-    const askSuffix = bidAskMatch[2];
-    const bid = parseFloat(bidStr);
-    const bidDec = bidStr.split('.')[1];
-    const ask = parseFloat(bidStr.split('.')[0] + '.' + bidDec.slice(0, bidDec.length - askSuffix.length) + askSuffix);
-
-    const rangeMatch = text.match(/(\d+\.\d+)\s*-\s*(\d+\.\d+)/);
-    const low  = rangeMatch ? parseFloat(rangeMatch[1]) : bid;
-    const high = rangeMatch ? parseFloat(rangeMatch[2]) : ask;
-    const varMatch = text.match(/([-+]?\d+\.\d+)%/);
-    const variation = varMatch ? parseFloat(varMatch[1]) : 0;
-    const spot = parseFloat(((bid + ask) / 2).toFixed(5));
-
-    return { buy: parseFloat(bid.toFixed(5)), sell: parseFloat(ask.toFixed(5)), spot, variation, high, low };
-  } finally {
-    await page.close().catch(() => {});
-  }
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+  });
 }
 
-async function refresh() {
-  log(`[${new Date().toISOString()}] fetch...`);
-  const rates = {};
+// ─── PARSE HTML ─────────────────────────────────────────────
+function parsePair(key, html) {
+  // Bid/Ask: "5.12776/3456" → bid=5.12776, ask reconstruído
+  const bidAskMatch = html.match(/(\d+\.\d{4,6})\/([\d]+)/);
+  if (!bidAskMatch) throw new Error(`${key}: padrão bid/ask não encontrado`);
 
-  // Se browser morreu, reinicia
-  if (!browser || !browser.isConnected()) {
-    await launchBrowser();
-  }
+  const bidStr = bidAskMatch[1];
+  const askSuffix = bidAskMatch[2];
+  const bid = parseFloat(bidStr);
+
+  // Reconstruir ask: pegar os primeiros dígitos decimais do bid + suffix
+  const bidDec = bidStr.split('.')[1];
+  const askDec = bidDec.slice(0, bidDec.length - askSuffix.length) + askSuffix;
+  const ask = parseFloat(bidStr.split('.')[0] + '.' + askDec);
+
+  // Range: "5.12030 - 5.16980"
+  const rangeMatch = html.match(/(\d+\.\d{3,6})\s*-\s*(\d+\.\d{3,6})/);
+  const low = rangeMatch ? parseFloat(rangeMatch[1]) : bid;
+  const high = rangeMatch ? parseFloat(rangeMatch[2]) : ask;
+
+  // Variation: "-0.17%"
+  const varMatch = html.match(/([-+]?\d+\.\d+)%/);
+  const variation = varMatch ? parseFloat(varMatch[1]) : 0;
+
+  const spot = parseFloat(((bid + ask) / 2).toFixed(5));
+
+  return { buy: bid, sell: ask, spot, variation, high, low };
+}
+
+// ─── REFRESH ────────────────────────────────────────────────
+async function refresh() {
+  log('fetch...');
+  const rates = {};
 
   for (const { key, path } of PAIRS) {
     try {
-      rates[key] = await fetchPair(key, path);
-      log(`✅ ${key}: ${rates[key].spot}`);
+      const html = await fetchPage(path);
+      rates[key] = parsePair(key, html);
+      log(`✅ ${key}: ${rates[key].buy}/${rates[key].sell} spot=${rates[key].spot}`);
     } catch (err) {
       log(`❌ ${key}: ${err.message}`);
-      // Se frame detached, reinicia browser para próximo par
-      if (err.message.includes('detached') || err.message.includes('detach') || err.message.includes('Navigating')) {
-        log('Reiniciando browser...');
-        await launchBrowser();
-      }
       rates[key] = (cache.rates && cache.rates[key]) || FALLBACK[key];
     }
   }
 
-  // AED via peg fixo USD
+  // AED via peg fixo USD/AED = 3.6725
   const usd = rates.USD;
   rates.AED = {
-    buy: parseFloat((usd.buy / AED_USD_PEG).toFixed(5)),
+    buy:  parseFloat((usd.buy  / AED_USD_PEG).toFixed(5)),
     sell: parseFloat((usd.sell / AED_USD_PEG).toFixed(5)),
     spot: parseFloat((usd.spot / AED_USD_PEG).toFixed(5)),
     variation: usd.variation,
     high: parseFloat((usd.high / AED_USD_PEG).toFixed(5)),
-    low: parseFloat((usd.low / AED_USD_PEG).toFixed(5)),
+    low:  parseFloat((usd.low  / AED_USD_PEG).toFixed(5)),
     source: 'peg',
   };
-  log(`✅ AED: ${rates.AED.spot} (peg)`);
+  log(`✅ AED: ${rates.AED.spot} (peg USD/AED)`);
 
   cache = { rates, updatedAt: new Date().toISOString() };
   log('Fetch concluído');
 }
 
+// ─── ROUTES ─────────────────────────────────────────────────
 app.get('/rates', (req, res) => res.json(cache.rates || FALLBACK));
 
 app.get('/health', (req, res) => res.json({
   status: cache.rates ? 'ok' : 'loading',
   updatedAt: cache.updatedAt,
-  browserAlive: !!(browser && browser.isConnected()),
   rates: cache.rates || FALLBACK,
   logs,
 }));
 
-app.listen(PORT, async () => {
+// ─── START ──────────────────────────────────────────────────
+app.listen(PORT, () => {
   log(`Proxy na porta ${PORT}`);
-  await launchBrowser();
   setTimeout(() => { refresh(); setInterval(refresh, 60 * 1000); }, 2000);
 });
