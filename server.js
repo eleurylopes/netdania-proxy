@@ -116,6 +116,8 @@ async function refresh() {
 }
 
 // ─── ROUTES ─────────────────────────────────────────────────
+app.get('/', (req, res) => res.json({ status: 'ok', service: 'netdania-proxy' }));
+
 app.get('/rates', (req, res) => res.json(cache.rates || FALLBACK));
 
 app.get('/health', (req, res) => res.json({
@@ -126,7 +128,7 @@ app.get('/health', (req, res) => res.json({
 }));
 
 // ─── START ──────────────────────────────────────────────────
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   log(`Proxy na porta ${PORT}`);
   setTimeout(() => { refresh(); setInterval(refresh, 60 * 1000); }, 2000);
 });
