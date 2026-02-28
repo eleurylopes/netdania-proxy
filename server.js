@@ -55,8 +55,8 @@ function fetchPage(path) {
 
 // ─── PARSE HTML ─────────────────────────────────────────────
 function parsePair(key, html) {
-  // Bid/Ask: "5.12776/3456" → bid=5.12776, ask reconstruído
-  const bidAskMatch = html.match(/(\d+\.\d{4,6})\/([\d]+)/);
+  // Bid/Ask: "5.12776/3456" ou "6.92/93" → formatos variados de precisão
+  const bidAskMatch = html.match(/(\d+\.\d{2,6})\/([\d]+)/);
   if (!bidAskMatch) throw new Error(`${key}: padrão bid/ask não encontrado`);
 
   const bidStr = bidAskMatch[1];
@@ -68,12 +68,12 @@ function parsePair(key, html) {
   const askDec = bidDec.slice(0, bidDec.length - askSuffix.length) + askSuffix;
   const ask = parseFloat(bidStr.split('.')[0] + '.' + askDec);
 
-  // Range: "5.12030 - 5.16980"
-  const rangeMatch = html.match(/(\d+\.\d{3,6})\s*-\s*(\d+\.\d{3,6})/);
+  // Range: "5.12030 - 5.16980" ou "6.89 - 6.96"
+  const rangeMatch = html.match(/(\d+\.\d{2,6})\s*-\s*(\d+\.\d{2,6})/);
   const low = rangeMatch ? parseFloat(rangeMatch[1]) : bid;
   const high = rangeMatch ? parseFloat(rangeMatch[2]) : ask;
 
-  // Variation: "-0.17%"
+  // Variation: "-0.17%" ou "-0.08%"
   const varMatch = html.match(/([-+]?\d+\.\d+)%/);
   const variation = varMatch ? parseFloat(varMatch[1]) : 0;
 
