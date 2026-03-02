@@ -1,10 +1,11 @@
 const express = require('express');
 const puppeteer = require('puppeteer-core');
+const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 3099;
-
 const AED_USD_PEG = 3.6725;
+const REFRESH_INTERVAL = 90 * 1000; // 90s
 
 const PAIRS = [
   { key: 'USD', url: 'https://m.netdania.com/currencies/usdbrl/idc-lite' },
@@ -21,267 +22,157 @@ const FALLBACK = {
 
 let cache = { rates: null, updatedAt: null, source: 'loading' };
 let logs = [];
-let browser = null;
+let refreshing = false;
 
 function log(level, msg) {
   const ts = new Date().toISOString();
-  const entry = { ts, level, msg };
   console.log(`[${level}] ${msg}`);
-  logs.unshift(entry);
-  if (logs.length > 50) logs.pop();
+  logs.unshift({ ts, level, msg });
+  if (logs.length > 40) logs.pop();
 }
 
-// ─── FIND CHROMIUM ──────────────────────────────────────────
 function findChromium() {
-  const fs = require('fs');
-  const paths = [
-    process.env.PUPPETEER_EXECUTABLE_PATH,
-    '/usr/bin/chromium',
-    '/usr/bin/chromium-browser',
-    '/usr/bin/google-chrome',
-    '/usr/bin/google-chrome-stable',
-  ].filter(Boolean);
-  for (const p of paths) {
-    if (fs.existsSync(p)) {
-      log('info', `Chromium encontrado: ${p}`);
-      return p;
-    }
+  for (const p of [process.env.PUPPETEER_EXECUTABLE_PATH, '/usr/bin/chromium', '/usr/bin/chromium-browser']) {
+    if (p && fs.existsSync(p)) return p;
   }
-  log('error', `Chromium não encontrado em: ${paths.join(', ')}`);
   return null;
 }
 
-// ─── LAUNCH BROWSER ─────────────────────────────────────────
-async function launchBrowser() {
-  if (browser) {
-    try { await browser.close(); } catch (_) {}
-  }
-  const execPath = findChromium();
-  if (!execPath) throw new Error('Chromium não instalado');
-
-  browser = await puppeteer.launch({
-    headless: 'new',
-    executablePath: execPath,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--disable-extensions',
-      '--disable-background-networking',
-      '--single-process',
-      '--no-zygote',
-    ],
-  });
-  log('info', 'Browser Puppeteer iniciado');
-}
-
-// ─── PARSE BID/ASK ──────────────────────────────────────────
 function parseBidAsk(str) {
   const m = str.match(/(\d+\.\d{2,6})\/([\d]+)/);
   if (!m) return null;
-
   const bidStr = m[1];
   const askSuffix = m[2];
   const bid = parseFloat(bidStr);
-
   const bidDec = bidStr.split('.')[1];
   const askDec = bidDec.slice(0, bidDec.length - askSuffix.length) + askSuffix;
   const ask = parseFloat(bidStr.split('.')[0] + '.' + askDec);
-
   return { bid, ask };
 }
 
-// ─── EXTRACT DATA FROM PAGE ─────────────────────────────────
-async function extractPair(key, url) {
-  const page = await browser.newPage();
-  try {
-    await page.setUserAgent(
-      'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
-    );
+function parseFromText(key, text) {
+  let bid = null, ask = null, variation = 0, high = null, low = null;
 
-    // Block images/fonts/media for speed
-    await page.setRequestInterception(true);
-    page.on('request', (req) => {
-      const type = req.resourceType();
-      if (['image', 'font', 'media'].includes(type)) {
-        req.abort();
-      } else {
-        req.continue();
-      }
-    });
-
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
-
-    // Wait a few seconds for any JS to execute
-    await new Promise(r => setTimeout(r, 3000));
-
-    // Extract everything we can from the page
-    const data = await page.evaluate(() => {
-      const result = {
-        spans: {},
-        bodyText: document.body.innerText.substring(0, 3000),
-        spanCount: document.querySelectorAll('span[id^="recid-"]').length,
-        title: document.title,
-      };
-      document.querySelectorAll('span[id^="recid-"]').forEach(s => {
-        result.spans[s.id] = s.textContent.trim();
-      });
-      return result;
-    });
-
-    log('info', `${key} title="${data.title}" recid_spans=${data.spanCount}`);
-    log('info', `${key} body(200): ${data.bodyText.substring(0, 200).replace(/\n/g, ' ')}`);
-
-    if (data.spanCount > 0) {
-      log('info', `${key} spans: ${JSON.stringify(data.spans)}`);
-    }
-
-    let bid = null, ask = null, variation = 0, high = null, low = null;
-
-    // Try recid spans first
-    for (const [id, val] of Object.entries(data.spans)) {
-      if (id.match(/recid-\d+-f6/) && val.match(/\d+\.\d+\/\d+/)) {
-        const parsed = parseBidAsk(val);
-        if (parsed) { bid = parsed.bid; ask = parsed.ask; }
-      }
-      if (id.match(/recid-\d+-f15/) && val.match(/[-+]?\d+\.?\d*%/)) {
-        const m = val.match(/([-+]?\d+\.?\d*)%/);
-        if (m) variation = parseFloat(m[1]);
-      }
-      if (id.match(/recid-\d+-f2/) && val.match(/\d+\.\d+\s*-\s*\d+\.\d+/)) {
-        const m = val.match(/(\d+\.\d+)\s*-\s*(\d+\.\d+)/);
-        if (m) { low = parseFloat(m[1]); high = parseFloat(m[2]); }
-      }
-    }
-
-    // Fallback: parse from body text
-    if (bid === null) {
-      const bodyText = data.bodyText;
-      const bidAskMatch = bodyText.match(/(\d+\.\d{2,6})\/([\d]+)/);
-      if (bidAskMatch) {
-        const parsed = parseBidAsk(bidAskMatch[0]);
-        if (parsed) { bid = parsed.bid; ask = parsed.ask; }
-      }
-      const varMatch = bodyText.match(/([-+]?\d+\.?\d*)%/);
-      if (varMatch) variation = parseFloat(varMatch[1]);
-      const rangeMatch = bodyText.match(/(\d+\.\d{2,6})\s*-\s*(\d+\.\d{2,6})/);
-      if (rangeMatch) { low = parseFloat(rangeMatch[1]); high = parseFloat(rangeMatch[2]); }
-    }
-
-    if (bid === null) throw new Error(`${key}: nenhum dado encontrado no body`);
-
-    if (!low) low = bid;
-    if (!high) high = ask;
-    const spot = parseFloat(((bid + ask) / 2).toFixed(5));
-
-    return { buy: bid, sell: ask, spot, variation, high, low };
-  } finally {
-    await page.close();
+  const bidAskMatch = text.match(/(\d+\.\d{2,6})\/([\d]+)/);
+  if (bidAskMatch) {
+    const parsed = parseBidAsk(bidAskMatch[0]);
+    if (parsed) { bid = parsed.bid; ask = parsed.ask; }
   }
+
+  const varMatch = text.match(/([-+]?\d+\.?\d*)%/);
+  if (varMatch) variation = parseFloat(varMatch[1]);
+
+  const rangeMatch = text.match(/(\d+\.\d{2,6})\s*-\s*(\d+\.\d{2,6})/);
+  if (rangeMatch) { low = parseFloat(rangeMatch[1]); high = parseFloat(rangeMatch[2]); }
+
+  if (bid === null) return null;
+  if (!low) low = bid;
+  if (!high) high = ask;
+  const spot = parseFloat(((bid + ask) / 2).toFixed(5));
+  return { buy: bid, sell: ask, spot, variation, high, low };
 }
 
-// ─── REFRESH ────────────────────────────────────────────────
+// ─── REFRESH: open browser, scrape all 3, close browser ─────
 async function refresh() {
-  log('info', 'Iniciando refresh...');
-  const rates = {};
-  let success = 0;
+  if (refreshing) { log('info', 'Skip (already refreshing)'); return; }
+  refreshing = true;
 
-  for (const { key, url } of PAIRS) {
-    try {
-      rates[key] = await extractPair(key, url);
-      log('info', `OK ${key}: ${rates[key].buy}/${rates[key].sell}`);
-      success++;
-    } catch (err) {
-      log('error', `FAIL ${key}: ${err.message}`);
-      rates[key] = (cache.rates && cache.rates[key]) || FALLBACK[key];
-    }
-  }
+  const execPath = findChromium();
+  if (!execPath) { log('error', 'Chromium not found'); refreshing = false; return; }
 
-  // AED via peg
-  const usd = rates.USD;
-  rates.AED = {
-    buy:  parseFloat((usd.buy  / AED_USD_PEG).toFixed(5)),
-    sell: parseFloat((usd.sell / AED_USD_PEG).toFixed(5)),
-    spot: parseFloat((usd.spot / AED_USD_PEG).toFixed(5)),
-    variation: usd.variation,
-    high: parseFloat((usd.high / AED_USD_PEG).toFixed(5)),
-    low:  parseFloat((usd.low  / AED_USD_PEG).toFixed(5)),
-  };
-  log('info', `OK AED: ${rates.AED.spot} (peg)`);
-
-  cache = {
-    rates,
-    updatedAt: new Date().toISOString(),
-    source: success > 0 ? 'netdania-live' : 'fallback',
-  };
-  log('info', `Refresh concluído (${success}/${PAIRS.length} OK)`);
-}
-
-// ─── SAFE REFRESH (restart browser on crash) ────────────────
-async function safeRefresh() {
+  let browser;
   try {
-    if (!browser || !browser.isConnected()) {
-      await launchBrowser();
+    browser = await puppeteer.launch({
+      headless: 'new',
+      executablePath: execPath,
+      args: [
+        '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+        '--disable-gpu', '--single-process', '--no-zygote',
+        '--js-flags=--max-old-space-size=128',
+        '--disable-extensions', '--disable-background-networking',
+        '--disable-default-apps', '--disable-sync', '--disable-translate',
+        '--mute-audio', '--no-first-run',
+      ],
+    });
+    log('info', 'Browser aberto');
+
+    const rates = {};
+    let success = 0;
+    const page = await browser.newPage();
+
+    await page.setUserAgent('Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)');
+    await page.setRequestInterception(true);
+    page.on('request', req => {
+      const t = req.resourceType();
+      if (['image', 'font', 'media', 'stylesheet'].includes(t)) req.abort();
+      else req.continue();
+    });
+
+    for (const { key, url } of PAIRS) {
+      try {
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+        await new Promise(r => setTimeout(r, 3000));
+
+        const text = await page.evaluate(() => document.body.innerText.substring(0, 2000));
+        const parsed = parseFromText(key, text);
+
+        if (parsed) {
+          rates[key] = parsed;
+          log('info', `OK ${key}: ${parsed.buy}/${parsed.sell} var=${parsed.variation}%`);
+          success++;
+        } else {
+          log('error', `FAIL ${key}: parse failed. Text: ${text.substring(0, 150)}`);
+          rates[key] = (cache.rates && cache.rates[key]) || FALLBACK[key];
+        }
+      } catch (err) {
+        log('error', `FAIL ${key}: ${err.message}`);
+        rates[key] = (cache.rates && cache.rates[key]) || FALLBACK[key];
+      }
     }
-    await refresh();
+
+    await page.close();
+
+    // AED via peg
+    const usd = rates.USD;
+    const fix5 = v => parseFloat(v.toFixed(5));
+    rates.AED = {
+      buy: fix5(usd.buy / AED_USD_PEG), sell: fix5(usd.sell / AED_USD_PEG),
+      spot: fix5(usd.spot / AED_USD_PEG), variation: usd.variation,
+      high: fix5(usd.high / AED_USD_PEG), low: fix5(usd.low / AED_USD_PEG),
+    };
+    log('info', `OK AED: ${rates.AED.spot} (peg)`);
+
+    cache = { rates, updatedAt: new Date().toISOString(), source: success > 0 ? 'netdania-live' : 'fallback' };
+    log('info', `Refresh OK (${success}/${PAIRS.length}). Mem: ${Math.round(process.memoryUsage().rss / 1024 / 1024)}MB`);
   } catch (err) {
-    log('error', `Refresh falhou: ${err.message}`);
-    try {
-      await launchBrowser();
-      await refresh();
-    } catch (err2) {
-      log('error', `Retry falhou: ${err2.message}`);
+    log('error', `Refresh error: ${err.message}`);
+  } finally {
+    if (browser) {
+      try { await browser.close(); } catch (_) {}
+      log('info', 'Browser fechado');
     }
+    refreshing = false;
   }
 }
 
-// ─── CORS ───────────────────────────────────────────────────
+// ─── CORS + ROUTES ──────────────────────────────────────────
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
   next();
 });
 
-// ─── ROUTES ─────────────────────────────────────────────────
-app.get('/', (req, res) => res.json({ status: 'ok', service: 'netdania-proxy', version: '3.0.0' }));
-
-app.get('/rates', (req, res) => {
-  res.json(cache.rates || FALLBACK);
-});
-
-app.get('/health', (req, res) => {
-  res.json({
-    status: cache.rates ? 'ok' : 'loading',
-    source: cache.source,
-    updatedAt: cache.updatedAt,
-    rates: cache.rates || FALLBACK,
-    logs: logs.slice(0, 30),
-    uptime: process.uptime(),
-    memory: process.memoryUsage(),
-  });
-});
+app.get('/', (req, res) => res.json({ status: 'ok', service: 'netdania-proxy', version: '3.1.0' }));
+app.get('/rates', (req, res) => res.json(cache.rates || FALLBACK));
+app.get('/health', (req, res) => res.json({
+  status: cache.rates ? 'ok' : 'loading', source: cache.source,
+  updatedAt: cache.updatedAt, rates: cache.rates || FALLBACK,
+  logs: logs.slice(0, 30), uptime: process.uptime(), memory: process.memoryUsage(),
+}));
 
 // ─── START ──────────────────────────────────────────────────
-const REFRESH_INTERVAL = 60 * 1000; // 60s
-
 app.listen(PORT, '0.0.0.0', () => {
-  log('info', `Proxy na porta ${PORT}`);
-  // Launch browser in background - don't block server startup
-  (async () => {
-    try {
-      await launchBrowser();
-      await safeRefresh();
-      setInterval(safeRefresh, REFRESH_INTERVAL);
-    } catch (err) {
-      log('error', `Startup falhou: ${err.message}\n${err.stack}`);
-    }
-  })();
+  log('info', `Proxy v3.1 na porta ${PORT}`);
+  setTimeout(() => refresh().then(() => setInterval(refresh, REFRESH_INTERVAL)), 1000);
 });
 
-// Cleanup
-process.on('SIGTERM', async () => {
-  log('info', 'SIGTERM recebido, fechando browser...');
-  if (browser) await browser.close();
-  process.exit(0);
-});
+process.on('SIGTERM', () => { log('info', 'SIGTERM'); process.exit(0); });
