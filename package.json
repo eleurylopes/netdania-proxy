@@ -1,12 +1,16 @@
 {
   "name": "netdania-proxy",
-  "version": "2.0.0",
-  "description": "Proxy de cotações via NetDania (fetch direto, sem Puppeteer)",
+  "version": "3.0.0",
+  "description": "Proxy de cotações via NetDania (Puppeteer headless browser)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "puppeteer": "^22.0.0"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
