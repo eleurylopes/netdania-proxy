@@ -113,34 +113,33 @@ async function extractPair(key, url) {
 
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
 
-    // Wait for streaming data to populate
-    await page.waitForFunction(() => {
-      // Check if recid spans have data
-      const spans = document.querySelectorAll('span[id^="recid-"]');
-      if (spans.length > 0) {
-        for (const s of spans) {
-          if (s.textContent && s.textContent.match(/\d+\.\d+/)) return true;
-        }
-      }
-      // Fallback: check body text
-      return document.body.innerText.match(/\d+\.\d{3,}\//);
-    }, { timeout: 20000 });
+    // Wait a few seconds for any JS to execute
+    await new Promise(r => setTimeout(r, 5000));
 
-    // Extract all data from the page
+    // Extract everything we can from the page
     const data = await page.evaluate(() => {
-      const result = { spans: {}, bodyText: '' };
+      const result = {
+        spans: {},
+        bodyText: document.body.innerText.substring(0, 3000),
+        spanCount: document.querySelectorAll('span[id^="recid-"]').length,
+        title: document.title,
+      };
       document.querySelectorAll('span[id^="recid-"]').forEach(s => {
         result.spans[s.id] = s.textContent.trim();
       });
-      result.bodyText = document.body.innerText.substring(0, 2000);
       return result;
     });
 
-    log('info', `${key} spans: ${JSON.stringify(data.spans)}`);
+    log('info', `${key} title="${data.title}" recid_spans=${data.spanCount}`);
+    log('info', `${key} body(200): ${data.bodyText.substring(0, 200).replace(/\n/g, ' ')}`);
+
+    if (data.spanCount > 0) {
+      log('info', `${key} spans: ${JSON.stringify(data.spans)}`);
+    }
 
     let bid = null, ask = null, variation = 0, high = null, low = null;
 
-    // Parse from recid spans first
+    // Try recid spans first
     for (const [id, val] of Object.entries(data.spans)) {
       if (id.match(/recid-\d+-f6/) && val.match(/\d+\.\d+\/\d+/)) {
         const parsed = parseBidAsk(val);
@@ -170,7 +169,7 @@ async function extractPair(key, url) {
       if (rangeMatch) { low = parseFloat(rangeMatch[1]); high = parseFloat(rangeMatch[2]); }
     }
 
-    if (bid === null) throw new Error(`${key}: nenhum dado encontrado`);
+    if (bid === null) throw new Error(`${key}: nenhum dado encontrado no body`);
 
     if (!low) low = bid;
     if (!high) high = ask;
