@@ -31,14 +31,37 @@ function log(level, msg) {
   if (logs.length > 50) logs.pop();
 }
 
+// ─── FIND CHROMIUM ──────────────────────────────────────────
+function findChromium() {
+  const fs = require('fs');
+  const paths = [
+    process.env.PUPPETEER_EXECUTABLE_PATH,
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+  ].filter(Boolean);
+  for (const p of paths) {
+    if (fs.existsSync(p)) {
+      log('info', `Chromium encontrado: ${p}`);
+      return p;
+    }
+  }
+  log('error', `Chromium não encontrado em: ${paths.join(', ')}`);
+  return null;
+}
+
 // ─── LAUNCH BROWSER ─────────────────────────────────────────
 async function launchBrowser() {
   if (browser) {
     try { await browser.close(); } catch (_) {}
   }
+  const execPath = findChromium();
+  if (!execPath) throw new Error('Chromium não instalado');
+
   browser = await puppeteer.launch({
     headless: 'new',
-    executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+    executablePath: execPath,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -236,11 +259,18 @@ app.get('/health', (req, res) => {
 // ─── START ──────────────────────────────────────────────────
 const REFRESH_INTERVAL = 60 * 1000; // 60s
 
-app.listen(PORT, '0.0.0.0', async () => {
+app.listen(PORT, '0.0.0.0', () => {
   log('info', `Proxy na porta ${PORT}`);
-  await launchBrowser();
-  await safeRefresh();
-  setInterval(safeRefresh, REFRESH_INTERVAL);
+  // Launch browser in background - don't block server startup
+  (async () => {
+    try {
+      await launchBrowser();
+      await safeRefresh();
+      setInterval(safeRefresh, REFRESH_INTERVAL);
+    } catch (err) {
+      log('error', `Startup falhou: ${err.message}\n${err.stack}`);
+    }
+  })();
 });
 
 // Cleanup
