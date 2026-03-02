@@ -88,7 +88,7 @@ async function openTab(key, url) {
   });
 
   await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
-  await new Promise(r => setTimeout(r, 3000));
+  await new Promise(r => setTimeout(r, 5000));
   return page;
 }
 
@@ -157,7 +157,7 @@ async function readAllPages() {
         log('info', `OK ${key}: ${parsed.buy}/${parsed.sell} var=${parsed.variation}%`);
         success++;
       } else {
-        log('error', `FAIL ${key}: parse failed`);
+        log('error', `FAIL ${key}: parse failed. Text(150): ${text.substring(0, 150).replace(/\n/g, ' ')}`);
         rates[key] = (cache.rates && cache.rates[key]) || FALLBACK[key];
       }
     } catch (err) {
