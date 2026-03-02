@@ -157,7 +157,12 @@ async function readAllPages() {
         log('info', `OK ${key}: ${parsed.buy}/${parsed.sell} var=${parsed.variation}%`);
         success++;
       } else {
-        log('error', `FAIL ${key}: parse failed. Text(150): ${text.substring(0, 150).replace(/\n/g, ' ')}`);
+        const is403 = text.includes('403') || text.includes('Forbidden');
+        if (is403) {
+          log('error', `FAIL ${key}: 403 ban ativo`);
+        } else {
+          log('error', `FAIL ${key}: parse failed. Text(150): ${text.substring(0, 150).replace(/\n/g, ' ')}`);
+        }
         rates[key] = (cache.rates && cache.rates[key]) || FALLBACK[key];
       }
     } catch (err) {
@@ -189,6 +194,27 @@ async function readAllPages() {
 
   cache = { rates, updatedAt: new Date().toISOString(), source: success > 0 ? 'netdania-live' : 'fallback' };
   log('info', `Read (${success}/${PAIRS.length}). Mem: ${Math.round(process.memoryUsage().rss / 1024 / 1024)}MB`);
+
+  // If all failed (probably banned), schedule tab reload
+  if (success === 0 && browserReady) {
+    const now = Date.now();
+    if (!readAllPages._lastRetry || (now - readAllPages._lastRetry) > 10 * 60 * 1000) {
+      readAllPages._lastRetry = now;
+      log('info', 'Todos falharam — tentando recarregar abas em 10min...');
+      setTimeout(async () => {
+        log('info', 'Retry: recarregando abas...');
+        for (const { key, url } of PAIRS) {
+          try {
+            if (pages[key]) { try { await pages[key].close(); } catch (_) {} }
+            pages[key] = await openTab(key, url);
+            log('info', `Retry: ${key} recarregada`);
+          } catch (err) {
+            log('error', `Retry: ${key} falhou: ${err.message}`);
+          }
+        }
+      }, 10 * 60 * 1000);
+    }
+  }
 }
 
 // ─── CORS + ROUTES ──────────────────────────────────────────
