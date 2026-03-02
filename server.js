@@ -5,7 +5,7 @@ const fs = require('fs');
 const app = express();
 const PORT = process.env.PORT || 3099;
 const AED_USD_PEG = 3.6725;
-const REFRESH_INTERVAL = 90 * 1000; // 90s
+const READ_INTERVAL = 30 * 1000; // read DOM every 30s (NO HTTP requests!)
 
 const PAIRS = [
   { key: 'USD', url: 'https://m.netdania.com/currencies/usdbrl/idc-lite' },
@@ -22,13 +22,15 @@ const FALLBACK = {
 
 let cache = { rates: null, updatedAt: null, source: 'loading' };
 let logs = [];
-let refreshing = false;
+let browser = null;
+let pages = {}; // { USD: page, EUR: page, GBP: page }
+let browserReady = false;
 
 function log(level, msg) {
   const ts = new Date().toISOString();
   console.log(`[${level}] ${msg}`);
   logs.unshift({ ts, level, msg });
-  if (logs.length > 40) logs.pop();
+  if (logs.length > 50) logs.pop();
 }
 
 function findChromium() {
@@ -72,87 +74,121 @@ function parseFromText(key, text) {
   return { buy: bid, sell: ask, spot, variation, high, low };
 }
 
-// ─── REFRESH: open browser, scrape all 3, close browser ─────
-async function refresh() {
-  if (refreshing) { log('info', 'Skip (already refreshing)'); return; }
-  refreshing = true;
+// ─── OPEN A SINGLE TAB ─────────────────────────────────────
+async function openTab(key, url) {
+  const page = await browser.newPage();
+  await page.setUserAgent(
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
+  );
+  await page.setRequestInterception(true);
+  page.on('request', req => {
+    const t = req.resourceType();
+    if (['image', 'font', 'media'].includes(t)) req.abort();
+    else req.continue();
+  });
 
+  await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+  await new Promise(r => setTimeout(r, 3000));
+  return page;
+}
+
+// ─── LAUNCH BROWSER + OPEN TABS (once!) ─────────────────────
+async function initBrowser() {
   const execPath = findChromium();
-  if (!execPath) { log('error', 'Chromium not found'); refreshing = false; return; }
+  if (!execPath) { log('error', 'Chromium not found'); return; }
 
-  let browser;
-  try {
-    browser = await puppeteer.launch({
-      headless: 'new',
-      executablePath: execPath,
-      args: [
-        '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
-        '--disable-gpu', '--single-process', '--no-zygote',
-        '--js-flags=--max-old-space-size=128',
-        '--disable-extensions', '--disable-background-networking',
-        '--disable-default-apps', '--disable-sync', '--disable-translate',
-        '--mute-audio', '--no-first-run',
-      ],
-    });
-    log('info', 'Browser aberto');
+  if (browser) { try { await browser.close(); } catch (_) {} }
+  pages = {};
+  browserReady = false;
 
-    const rates = {};
-    let success = 0;
-    const page = await browser.newPage();
+  browser = await puppeteer.launch({
+    headless: 'new',
+    executablePath: execPath,
+    args: [
+      '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+      '--disable-gpu', '--disable-extensions', '--disable-background-networking',
+      '--disable-default-apps', '--disable-sync', '--disable-translate',
+      '--mute-audio', '--no-first-run', '--no-zygote',
+      '--js-flags=--max-old-space-size=192',
+    ],
+  });
+  log('info', 'Browser iniciado');
 
-    await page.setUserAgent('Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)');
-    await page.setRequestInterception(true);
-    page.on('request', req => {
-      const t = req.resourceType();
-      if (['image', 'font', 'media', 'stylesheet'].includes(t)) req.abort();
-      else req.continue();
-    });
+  // Open one permanent tab per currency pair
+  for (const { key, url } of PAIRS) {
+    try {
+      log('info', `${key}: abrindo aba...`);
+      pages[key] = await openTab(key, url);
+      log('info', `${key}: aba aberta OK`);
+    } catch (err) {
+      log('error', `${key}: erro ao abrir: ${err.message}`);
+    }
+  }
 
-    for (const { key, url } of PAIRS) {
-      try {
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
-        await new Promise(r => setTimeout(r, 3000));
+  browserReady = true;
+  log('info', `Browser pronto com ${Object.keys(pages).length} abas permanentes`);
+  await readAllPages();
+}
 
-        const text = await page.evaluate(() => document.body.innerText.substring(0, 2000));
-        const parsed = parseFromText(key, text);
+// ─── READ DOM — zero HTTP requests! ─────────────────────────
+async function readAllPages() {
+  if (!browserReady || !browser || !browser.isConnected()) {
+    log('error', 'Browser desconectado, reiniciando...');
+    await initBrowser();
+    return;
+  }
 
-        if (parsed) {
-          rates[key] = parsed;
-          log('info', `OK ${key}: ${parsed.buy}/${parsed.sell} var=${parsed.variation}%`);
-          success++;
-        } else {
-          log('error', `FAIL ${key}: parse failed. Text: ${text.substring(0, 150)}`);
-          rates[key] = (cache.rates && cache.rates[key]) || FALLBACK[key];
-        }
-      } catch (err) {
-        log('error', `FAIL ${key}: ${err.message}`);
+  const rates = {};
+  let success = 0;
+
+  for (const { key } of PAIRS) {
+    const page = pages[key];
+    if (!page) {
+      rates[key] = (cache.rates && cache.rates[key]) || FALLBACK[key];
+      continue;
+    }
+
+    try {
+      const text = await page.evaluate(() => document.body.innerText.substring(0, 2000));
+      const parsed = parseFromText(key, text);
+
+      if (parsed) {
+        rates[key] = parsed;
+        log('info', `OK ${key}: ${parsed.buy}/${parsed.sell} var=${parsed.variation}%`);
+        success++;
+      } else {
+        log('error', `FAIL ${key}: parse failed`);
         rates[key] = (cache.rates && cache.rates[key]) || FALLBACK[key];
       }
+    } catch (err) {
+      log('error', `FAIL ${key}: ${err.message}`);
+      rates[key] = (cache.rates && cache.rates[key]) || FALLBACK[key];
+
+      // Tab crashed — reopen it (single HTTP request)
+      if (err.message.includes('detached') || err.message.includes('closed') || err.message.includes('crashed')) {
+        log('info', `${key}: aba crashou, reabrindo...`);
+        try {
+          const pair = PAIRS.find(p => p.key === key);
+          pages[key] = await openTab(key, pair.url);
+          log('info', `${key}: aba reaberta`);
+        } catch (reopenErr) {
+          log('error', `${key}: falha ao reabrir: ${reopenErr.message}`);
+        }
+      }
     }
-
-    await page.close();
-
-    // AED via peg
-    const usd = rates.USD;
-    const fix5 = v => parseFloat(v.toFixed(5));
-    rates.AED = {
-      buy: fix5(usd.buy / AED_USD_PEG), sell: fix5(usd.sell / AED_USD_PEG),
-      spot: fix5(usd.spot / AED_USD_PEG), variation: usd.variation,
-      high: fix5(usd.high / AED_USD_PEG), low: fix5(usd.low / AED_USD_PEG),
-    };
-    log('info', `OK AED: ${rates.AED.spot} (peg)`);
-
-    cache = { rates, updatedAt: new Date().toISOString(), source: success > 0 ? 'netdania-live' : 'fallback' };
-    log('info', `Refresh OK (${success}/${PAIRS.length}). Mem: ${Math.round(process.memoryUsage().rss / 1024 / 1024)}MB`);
-  } catch (err) {
-    log('error', `Refresh error: ${err.message}`);
-  } finally {
-    if (browser) {
-      try { await browser.close(); } catch (_) {}
-      log('info', 'Browser fechado');
-    }
-    refreshing = false;
   }
+
+  // AED via USD peg
+  const usd = rates.USD;
+  const fix5 = v => parseFloat(v.toFixed(5));
+  rates.AED = {
+    buy: fix5(usd.buy / AED_USD_PEG), sell: fix5(usd.sell / AED_USD_PEG),
+    spot: fix5(usd.spot / AED_USD_PEG), variation: usd.variation,
+    high: fix5(usd.high / AED_USD_PEG), low: fix5(usd.low / AED_USD_PEG),
+  };
+
+  cache = { rates, updatedAt: new Date().toISOString(), source: success > 0 ? 'netdania-live' : 'fallback' };
+  log('info', `Read (${success}/${PAIRS.length}). Mem: ${Math.round(process.memoryUsage().rss / 1024 / 1024)}MB`);
 }
 
 // ─── CORS + ROUTES ──────────────────────────────────────────
@@ -161,18 +197,33 @@ app.use((req, res, next) => {
   next();
 });
 
-app.get('/', (req, res) => res.json({ status: 'ok', service: 'netdania-proxy', version: '3.1.0' }));
+app.get('/', (req, res) => res.json({ status: 'ok', service: 'netdania-proxy', version: '4.0.0' }));
 app.get('/rates', (req, res) => res.json(cache.rates || FALLBACK));
 app.get('/health', (req, res) => res.json({
   status: cache.rates ? 'ok' : 'loading', source: cache.source,
   updatedAt: cache.updatedAt, rates: cache.rates || FALLBACK,
+  openTabs: Object.keys(pages), browserConnected: browser ? browser.isConnected() : false,
   logs: logs.slice(0, 30), uptime: process.uptime(), memory: process.memoryUsage(),
 }));
 
 // ─── START ──────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
-  log('info', `Proxy v3.1 na porta ${PORT}`);
-  setTimeout(() => refresh().then(() => setInterval(refresh, REFRESH_INTERVAL)), 1000);
+  log('info', `Proxy v4.0 na porta ${PORT}`);
+  setTimeout(async () => {
+    try {
+      await initBrowser();
+      setInterval(async () => {
+        try { await readAllPages(); }
+        catch (err) { log('error', `Read error: ${err.message}`); }
+      }, READ_INTERVAL);
+    } catch (err) {
+      log('error', `Init failed: ${err.message}`);
+    }
+  }, 1000);
 });
 
-process.on('SIGTERM', () => { log('info', 'SIGTERM'); process.exit(0); });
+process.on('SIGTERM', async () => {
+  log('info', 'SIGTERM');
+  if (browser) try { await browser.close(); } catch (_) {}
+  process.exit(0);
+});
