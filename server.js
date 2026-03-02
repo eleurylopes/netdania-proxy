@@ -114,7 +114,7 @@ async function extractPair(key, url) {
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
 
     // Wait a few seconds for any JS to execute
-    await new Promise(r => setTimeout(r, 5000));
+    await new Promise(r => setTimeout(r, 3000));
 
     // Extract everything we can from the page
     const data = await page.evaluate(() => {
@@ -235,6 +235,13 @@ async function safeRefresh() {
     }
   }
 }
+
+// ─── CORS ───────────────────────────────────────────────────
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+  next();
+});
 
 // ─── ROUTES ─────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({ status: 'ok', service: 'netdania-proxy', version: '3.0.0' }));
